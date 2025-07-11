@@ -10,9 +10,6 @@ pdfminer.six>=20221105
 # Tabula (may have issues on Streamlit Cloud)
 tabula-py>=2.5.0
 
-# Camelot - Use minimal version for cloud
-camelot-py[base]>=0.10.0
-
 # Additional Dependencies
 opencv-python-headless>=4.5.0
 openpyxl>=3.0.0

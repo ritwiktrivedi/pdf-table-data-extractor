@@ -5,6 +5,7 @@ import tempfile
 import os
 from typing import List, Dict, Optional, Tuple
 import re
+import numpy as np
 
 # Import PDF processing libraries
 try:
@@ -25,12 +26,6 @@ try:
     TABULA_AVAILABLE = True
 except ImportError:
     TABULA_AVAILABLE = False
-
-try:
-    import camelot
-    CAMELOT_AVAILABLE = True
-except ImportError:
-    CAMELOT_AVAILABLE = False
 
 
 def check_dependencies():
@@ -53,117 +48,162 @@ def check_dependencies():
     else:
         missing.append("tabula-py")
 
-    if CAMELOT_AVAILABLE:
-        available.append("Camelot")
-    else:
-        missing.append("camelot-py[base]")
-
     return available, missing
 
 
-def make_unique_columns(columns: List[str]) -> List[str]:
-    """Make column names unique by adding suffixes to duplicates"""
-    if not columns:
-        return []
+def is_likely_header_row(row_data: List[str], min_non_empty_ratio: float = 0.6) -> bool:
+    """
+    Determine if a row is likely a header row based on content analysis
+    """
+    if not row_data:
+        return False
 
-    # Convert to strings and handle None values
-    columns = [str(col) if col is not None else '' for col in columns]
+    # Convert to strings and clean
+    clean_row = [str(cell).strip() for cell in row_data]
 
-    # Keep track of column name counts
-    column_counts = {}
-    unique_columns = []
+    # Calculate ratio of non-empty cells
+    non_empty_cells = sum(
+        1 for cell in clean_row if cell and cell.lower() not in ['', 'nan', 'none'])
+    non_empty_ratio = non_empty_cells / \
+        len(clean_row) if len(clean_row) > 0 else 0
 
-    for col in columns:
-        # Clean up the column name
-        col = col.strip()
+    # If too many empty cells, likely not a header
+    if non_empty_ratio < min_non_empty_ratio:
+        return False
 
-        # If empty, give it a default name
-        if not col:
-            col = 'Column'
+    # Check for header-like characteristics
+    header_indicators = 0
 
-        # Handle duplicates
-        if col in column_counts:
-            column_counts[col] += 1
-            unique_col = f"{col}_{column_counts[col]}"
-        else:
-            column_counts[col] = 0
-            unique_col = col
+    for cell in clean_row:
+        if not cell or cell.lower() in ['', 'nan', 'none']:
+            continue
 
-        unique_columns.append(unique_col)
+        # Check for common header patterns
+        if any(keyword in cell.lower() for keyword in ['name', 'date', 'amount', 'total', 'id', 'number', 'type', 'status']):
+            header_indicators += 1
 
-    return unique_columns
+        # Check if mostly alphabetic (header-like)
+        if re.match(r'^[a-zA-Z\s]+$', cell):
+            header_indicators += 1
+
+        # Check for camelCase or snake_case (common in headers)
+        if re.match(r'^[a-zA-Z][a-zA-Z0-9_]*[a-zA-Z0-9]$', cell):
+            header_indicators += 1
+
+    # If we have some header indicators and good fill ratio, likely a header
+    return header_indicators >= min(2, len([c for c in clean_row if c]))
+
+
+def detect_real_header(table_data: List[List[str]], max_header_row: int = 3) -> Tuple[int, List[str]]:
+    """
+    Detect the actual header row in table data
+    Returns: (header_row_index, header_row_data)
+    """
+    if not table_data:
+        return -1, []
+
+    best_header_idx = 0
+    best_score = -1
+
+    # Check first few rows for the best header candidate
+    for i in range(min(max_header_row, len(table_data))):
+        row = table_data[i]
+
+        # Skip completely empty rows
+        if not any(str(cell).strip() for cell in row):
+            continue
+
+        # Calculate header score
+        score = 0
+
+        # Check non-empty ratio
+        non_empty_cells = sum(1 for cell in row if str(cell).strip() and str(
+            cell).strip().lower() not in ['nan', 'none'])
+        non_empty_ratio = non_empty_cells / len(row) if len(row) > 0 else 0
+
+        if non_empty_ratio > 0.5:
+            score += 2
+
+        # Check for header-like content
+        if is_likely_header_row(row):
+            score += 3
+
+        # Prefer earlier rows (typical header position)
+        score += (max_header_row - i) * 0.5
+
+        if score > best_score:
+            best_score = score
+            best_header_idx = i
+
+    return best_header_idx, table_data[best_header_idx] if best_header_idx < len(table_data) else []
 
 
 def extract_with_pymupdf(pdf_path: str) -> Tuple[List[pd.DataFrame], Dict]:
-    """Extract tables using PyMuPDF with improved error handling"""
+    """Extract tables using PyMuPDF with improved header detection"""
     if not PYMUPDF_AVAILABLE:
         return [], {"error": "PyMuPDF not available"}
 
     try:
         doc = fitz.open(pdf_path)
         tables = []
-        errors = []
         metadata = {
             "total_pages": len(doc),
             "method": "PyMuPDF",
             "tables_found": 0,
-            "errors": []
+            "extraction_details": []
         }
 
         for page_num in range(len(doc)):
-            try:
-                page = doc.load_page(page_num)
+            page = doc.load_page(page_num)
 
-                # Try to find tables
-                tabs = page.find_tables()
+            # Try to find tables
+            tabs = page.find_tables()
 
-                for tab_idx, tab in enumerate(tabs):
-                    try:
-                        # Extract table data
-                        table_data = tab.extract()
-                        if table_data and len(table_data) > 0:
-                            # Handle the case where there might be no header row
-                            if len(table_data) == 1:
-                                # Only one row, treat it as data with auto-generated columns
-                                df = pd.DataFrame([table_data[0]])
-                                df.columns = [
-                                    f'Column_{i+1}' for i in range(len(df.columns))]
-                            else:
-                                # Multiple rows, first row as header
-                                headers = table_data[0]
-                                data_rows = table_data[1:]
+            for tab_idx, tab in enumerate(tabs):
+                # Extract table data
+                table_data = tab.extract()
+                if not table_data:
+                    continue
 
-                                # Make column names unique
-                                unique_headers = make_unique_columns(headers)
+                # Detect real header row
+                header_idx, header_row = detect_real_header(table_data)
 
-                                # Create DataFrame with proper error handling
-                                try:
-                                    df = pd.DataFrame(
-                                        data_rows, columns=unique_headers)
-                                except ValueError as e:
-                                    # If there's still an issue, create with auto-generated columns
-                                    df = pd.DataFrame(data_rows)
-                                    df.columns = [
-                                        f'Column_{i+1}' for i in range(len(df.columns))]
-                                    errors.append(
-                                        f"Page {page_num + 1}, Table {tab_idx + 1}: Used auto-generated column names due to: {str(e)}")
+                extraction_detail = {
+                    "page": page_num + 1,
+                    "table": tab_idx + 1,
+                    "original_rows": len(table_data),
+                    "detected_header_row": header_idx,
+                    # First 5 columns for preview
+                    "header_content": header_row[:5] if header_row else []
+                }
 
-                            # Add metadata to the DataFrame
-                            df.name = f"Page_{page_num + 1}_Table_{tab_idx + 1}"
-                            tables.append(df)
+                if header_idx >= 0 and header_idx < len(table_data):
+                    # Use detected header
+                    header = table_data[header_idx]
+                    data_rows = table_data[header_idx + 1:]
 
-                    except Exception as e:
-                        error_msg = f"Page {page_num + 1}, Table {tab_idx + 1}: {str(e)}"
-                        errors.append(error_msg)
-                        continue
+                    # Clean header names
+                    clean_header = []
+                    for i, col in enumerate(header):
+                        col_name = str(col).strip()
+                        if not col_name or col_name.lower() in ['', 'nan', 'none']:
+                            col_name = f"Column_{i+1}"
+                        clean_header.append(col_name)
 
-            except Exception as e:
-                error_msg = f"Page {page_num + 1}: {str(e)}"
-                errors.append(error_msg)
-                continue
+                    # Create DataFrame
+                    if data_rows:
+                        df = pd.DataFrame(data_rows, columns=clean_header)
+                    else:
+                        df = pd.DataFrame(columns=clean_header)
+                else:
+                    # Fallback: use first row as header
+                    df = pd.DataFrame(table_data[1:], columns=table_data[0])
+
+                df.name = f"Page_{page_num + 1}_Table_{tab_idx + 1}"
+                tables.append(df)
+                metadata["extraction_details"].append(extraction_detail)
 
         metadata["tables_found"] = len(tables)
-        metadata["errors"] = errors
         doc.close()
         return tables, metadata
 
@@ -172,7 +212,7 @@ def extract_with_pymupdf(pdf_path: str) -> Tuple[List[pd.DataFrame], Dict]:
 
 
 def extract_with_tabula(pdf_path: str, pages: str = "all") -> Tuple[List[pd.DataFrame], Dict]:
-    """Extract tables using Tabula"""
+    """Extract tables using Tabula with improved header detection"""
     if not TABULA_AVAILABLE:
         return [], {"error": "Tabula not available"}
 
@@ -186,7 +226,7 @@ def extract_with_tabula(pdf_path: str, pages: str = "all") -> Tuple[List[pd.Data
         ]
 
         best_result = []
-        best_metadata = {"tables_found": 0}
+        best_metadata = {"tables_found": 0, "extraction_details": []}
 
         for method_config in methods:
             try:
@@ -196,80 +236,82 @@ def extract_with_tabula(pdf_path: str, pages: str = "all") -> Tuple[List[pd.Data
                         pages=pages,
                         multiple_tables=True,
                         lattice=(method_config["method"] == "lattice"),
-                        stream=(method_config["method"] == "stream"),
-                        pandas_options={'on_bad_lines': 'skip'}
+                        stream=(method_config["method"] == "stream")
                     )
                 else:
                     df = tabula.read_pdf(
                         pdf_path,
                         pages=pages,
                         lattice=(method_config["method"] == "lattice"),
-                        stream=(method_config["method"] == "stream"),
-                        pandas_options={'on_bad_lines': 'skip'}
+                        stream=(method_config["method"] == "stream")
                     )
                     dfs = [df] if not df.empty else []
 
-                if len(dfs) > len(best_result):
-                    best_result = dfs
+                # Process each DataFrame to fix headers
+                processed_dfs = []
+                extraction_details = []
+
+                for i, df in enumerate(dfs):
+                    if df.empty:
+                        continue
+
+                    # Convert DataFrame to list format for header detection
+                    table_data = [df.columns.tolist()] + df.values.tolist()
+
+                    # Detect real header
+                    header_idx, header_row = detect_real_header(table_data)
+
+                    detail = {
+                        "table": i + 1,
+                        "original_rows": len(df),
+                        "detected_header_row": header_idx,
+                        "header_content": header_row[:5] if header_row else []
+                    }
+
+                    if header_idx > 0:  # Header is not the first row
+                        # Reconstruct DataFrame with correct header
+                        new_header = table_data[header_idx]
+                        new_data = table_data[header_idx + 1:]
+
+                        # Clean header names
+                        clean_header = []
+                        for j, col in enumerate(new_header):
+                            col_name = str(col).strip()
+                            if not col_name or col_name.lower() in ['', 'nan', 'none']:
+                                col_name = f"Column_{j+1}"
+                            clean_header.append(col_name)
+
+                        if new_data:
+                            new_df = pd.DataFrame(
+                                new_data, columns=clean_header)
+                        else:
+                            new_df = pd.DataFrame(columns=clean_header)
+
+                        new_df.name = f"Table_{i + 1}"
+                        processed_dfs.append(new_df)
+                    else:
+                        # Use original DataFrame
+                        df.name = f"Table_{i + 1}"
+                        processed_dfs.append(df)
+
+                    extraction_details.append(detail)
+
+                if len(processed_dfs) > len(best_result):
+                    best_result = processed_dfs
                     best_metadata = {
                         "method": f"Tabula ({method_config['method']})",
-                        "tables_found": len(dfs),
-                        "multiple_tables": method_config["multiple_tables"]
+                        "tables_found": len(processed_dfs),
+                        "multiple_tables": method_config["multiple_tables"],
+                        "extraction_details": extraction_details
                     }
 
             except Exception as e:
                 continue
-
-        # Add names to DataFrames and fix column names
-        for i, df in enumerate(best_result):
-            df.name = f"Table_{i + 1}"
-            # Fix duplicate column names if any
-            if df.columns.duplicated().any():
-                df.columns = make_unique_columns(df.columns.tolist())
 
         return best_result, best_metadata
 
     except Exception as e:
         return [], {"error": f"Tabula error: {str(e)}"}
-
-
-def extract_with_camelot(pdf_path: str, pages: str = "all") -> Tuple[List[pd.DataFrame], Dict]:
-    """Extract tables using Camelot"""
-    if not CAMELOT_AVAILABLE:
-        return [], {"error": "Camelot not available"}
-
-    try:
-        # Try both lattice and stream methods
-        methods = ["lattice", "stream"]
-        best_result = []
-        best_metadata = {"tables_found": 0}
-
-        for method in methods:
-            try:
-                tables = camelot.read_pdf(pdf_path, pages=pages, flavor=method)
-
-                if len(tables) > len(best_result):
-                    best_result = [table.df for table in tables]
-                    best_metadata = {
-                        "method": f"Camelot ({method})",
-                        "tables_found": len(tables),
-                        "accuracy": [table.accuracy for table in tables] if tables else []
-                    }
-
-            except Exception as e:
-                continue
-
-        # Add names to DataFrames and fix column names
-        for i, df in enumerate(best_result):
-            df.name = f"Table_{i + 1}"
-            # Fix duplicate column names if any
-            if df.columns.duplicated().any():
-                df.columns = make_unique_columns(df.columns.tolist())
-
-        return best_result, best_metadata
-
-    except Exception as e:
-        return [], {"error": f"Camelot error: {str(e)}"}
 
 
 def extract_text_with_pdfminer(pdf_path: str) -> Tuple[str, Dict]:
@@ -290,56 +332,24 @@ def extract_text_with_pdfminer(pdf_path: str) -> Tuple[str, Dict]:
         return "", {"error": f"PDFMiner error: {str(e)}"}
 
 
-def analyze_pdf_structure(text: str) -> Dict:
-    """Analyze PDF structure to identify headers and patterns"""
-    lines = text.split('\n')
-    non_empty_lines = [line.strip() for line in lines if line.strip()]
-
-    # Try to identify repeating headers
-    line_frequencies = {}
-    for line in non_empty_lines:
-        if len(line) > 20:  # Only consider substantial lines
-            line_frequencies[line] = line_frequencies.get(line, 0) + 1
-
-    # Find potential headers (lines that repeat)
-    potential_headers = {line: count for line, count in line_frequencies.items()
-                         if count > 1 and len(line) > 30}
-
-    # Analyze structure
-    analysis = {
-        "total_lines": len(lines),
-        "non_empty_lines": len(non_empty_lines),
-        "potential_headers": potential_headers,
-        "has_repeating_headers": len(potential_headers) > 0,
-        "avg_line_length": sum(len(line) for line in non_empty_lines) / len(non_empty_lines) if non_empty_lines else 0
-    }
-
-    return analysis
-
-
 def clean_dataframe(df: pd.DataFrame, remove_empty_rows: bool = True,
                     remove_empty_cols: bool = True) -> pd.DataFrame:
     """Clean extracted DataFrame"""
     df_clean = df.copy()
 
     if remove_empty_rows:
+        # Remove rows that are completely empty or only contain NaN/None/empty strings
         df_clean = df_clean.dropna(how='all')
+        mask = df_clean.astype(str).apply(
+            lambda x: x.str.strip().str.lower().isin(['', 'nan', 'none'])).all(axis=1)
+        df_clean = df_clean[~mask]
 
     if remove_empty_cols:
+        # Remove columns that are completely empty
         df_clean = df_clean.dropna(axis=1, how='all')
-
-    # Try to identify and remove header repetitions
-    if len(df_clean) > 1:
-        # Check if first row repeats in the data
-        first_row = df_clean.iloc[0].astype(str)
-        duplicate_rows = []
-
-        for i in range(1, len(df_clean)):
-            if df_clean.iloc[i].astype(str).equals(first_row):
-                duplicate_rows.append(i)
-
-        if duplicate_rows:
-            df_clean = df_clean.drop(duplicate_rows)
+        for col in df_clean.columns:
+            if df_clean[col].astype(str).str.strip().str.lower().isin(['', 'nan', 'none']).all():
+                df_clean = df_clean.drop(columns=[col])
 
     return df_clean
 
@@ -353,26 +363,17 @@ def main():
 
     st.title("📊 PDF Table Extractor")
     st.markdown(
-        "Extract tabular data from PDFs using multiple extraction methods")
+        "Extract tabular data from PDFs using PyMuPDF and Tabula with improved header detection")
 
     # Check dependencies
     available_libs, missing_libs = check_dependencies()
 
     if missing_libs:
         st.warning(f"Missing libraries: {', '.join(missing_libs)}")
-        st.markdown("**Install them using:**")
+        st.markdown("Install them using:")
+        st.code(f"pip install {' '.join(missing_libs)}")
 
-        # Show specific installation commands
-        for lib in missing_libs:
-            if lib == "camelot-py[base]":
-                st.code("pip install camelot-py[base]")
-                st.info(
-                    "Note: For Camelot with advanced features, you may also need: `pip install camelot-py[cv]`")
-            else:
-                st.code(f"pip install {lib}")
-
-    if available_libs:
-        st.success(f"Available libraries: {', '.join(available_libs)}")
+    st.success(f"Available libraries: {', '.join(available_libs)}")
 
     # File upload
     uploaded_file = st.file_uploader("Choose a PDF file", type="pdf")
@@ -393,8 +394,6 @@ def main():
                 available_methods.append("PyMuPDF")
             if TABULA_AVAILABLE:
                 available_methods.append("Tabula")
-            if CAMELOT_AVAILABLE:
-                available_methods.append("Camelot")
             if PDFMINER_AVAILABLE:
                 available_methods.append("PDFMiner (Text)")
 
@@ -437,9 +436,6 @@ def main():
                     elif selected_method == "Tabula":
                         tables, metadata = extract_with_tabula(
                             tmp_path, pages_param)
-                    elif selected_method == "Camelot":
-                        tables, metadata = extract_with_camelot(
-                            tmp_path, pages_param)
                     elif selected_method == "PDFMiner (Text)":
                         text, metadata = extract_text_with_pdfminer(tmp_path)
                         tables = []
@@ -454,37 +450,10 @@ def main():
                             st.subheader("Extraction Metadata")
                             st.json(metadata)
 
-                            # Show errors if any
-                            if "errors" in metadata and metadata["errors"]:
-                                st.subheader("Warnings/Errors")
-                                for error in metadata["errors"]:
-                                    st.warning(error)
-
                         with col1:
                             if selected_method == "PDFMiner (Text)":
                                 st.subheader("Extracted Text")
                                 st.text_area("Raw Text", text, height=400)
-
-                                # Analyze structure
-                                st.subheader("PDF Structure Analysis")
-                                analysis = analyze_pdf_structure(text)
-
-                                st.write(
-                                    f"**Total lines:** {analysis['total_lines']}")
-                                st.write(
-                                    f"**Non-empty lines:** {analysis['non_empty_lines']}")
-                                st.write(
-                                    f"**Has repeating headers:** {analysis['has_repeating_headers']}")
-                                st.write(
-                                    f"**Average line length:** {analysis['avg_line_length']:.1f}")
-
-                                if analysis['potential_headers']:
-                                    st.write(
-                                        "**Potential repeating headers:**")
-                                    for header, count in analysis['potential_headers'].items():
-                                        st.write(
-                                            f"- Appears {count} times: {header[:100]}...")
-
                             else:
                                 st.subheader("Extracted Tables")
 
@@ -496,6 +465,12 @@ def main():
                                     for i, df in enumerate(tables):
                                         st.write(
                                             f"**Table {i+1}** ({df.shape[0]} rows × {df.shape[1]} columns)")
+
+                                        # Show extraction details if available
+                                        if "extraction_details" in metadata and i < len(metadata["extraction_details"]):
+                                            details = metadata["extraction_details"][i]
+                                            st.caption(
+                                                f"Header detected at row {details['detected_header_row']}")
 
                                         # Clean the dataframe
                                         df_clean = clean_dataframe(
@@ -533,29 +508,6 @@ def main():
 
                         if "error" not in text_metadata:
                             st.subheader("PDF Structure Analysis")
-                            analysis = analyze_pdf_structure(text)
-
-                            col1, col2 = st.columns(2)
-
-                            with col1:
-                                st.metric("Total Lines",
-                                          analysis['total_lines'])
-                                st.metric("Non-empty Lines",
-                                          analysis['non_empty_lines'])
-                                st.metric("Average Line Length",
-                                          f"{analysis['avg_line_length']:.1f}")
-
-                            with col2:
-                                st.metric(
-                                    "Has Repeating Headers", "Yes" if analysis['has_repeating_headers'] else "No")
-                                st.metric("Potential Headers Found", len(
-                                    analysis['potential_headers']))
-
-                            if analysis['potential_headers']:
-                                st.subheader("Potential Repeating Headers")
-                                for header, count in analysis['potential_headers'].items():
-                                    with st.expander(f"Appears {count} times"):
-                                        st.text(header)
 
                             # Show sample text
                             st.subheader("Sample Text (First 1000 characters)")
