@@ -94,13 +94,22 @@ def is_likely_header_row(row_data: List[str], min_non_empty_ratio: float = 0.6) 
     return header_indicators >= min(2, len([c for c in clean_row if c]))
 
 
-def detect_real_header(table_data: List[List[str]], max_header_row: int = 3) -> Tuple[int, List[str]]:
+def detect_real_header(table_data: List[List[str]], max_header_row: int = 3,
+                       header_mode: str = "auto") -> Tuple[int, List[str]]:
     """
     Detect the actual header row in table data
+    Args:
+        table_data: List of rows (each row is a list of cells)
+        max_header_row: Maximum row index to check for headers
+        header_mode: "auto", "first_only", or "every_page"
     Returns: (header_row_index, header_row_data)
     """
     if not table_data:
         return -1, []
+
+    if header_mode == "first_only":
+        # Only use first row as header
+        return 0, table_data[0]
 
     best_header_idx = 0
     best_score = -1
@@ -138,7 +147,7 @@ def detect_real_header(table_data: List[List[str]], max_header_row: int = 3) -> 
     return best_header_idx, table_data[best_header_idx] if best_header_idx < len(table_data) else []
 
 
-def extract_with_pymupdf(pdf_path: str) -> Tuple[List[pd.DataFrame], Dict]:
+def extract_with_pymupdf(pdf_path: str, header_mode: str = "auto") -> Tuple[List[pd.DataFrame], Dict]:
     """Extract tables using PyMuPDF with improved header detection"""
     if not PYMUPDF_AVAILABLE:
         return [], {"error": "PyMuPDF not available"}
@@ -166,7 +175,10 @@ def extract_with_pymupdf(pdf_path: str) -> Tuple[List[pd.DataFrame], Dict]:
                     continue
 
                 # Detect real header row
-                header_idx, header_row = detect_real_header(table_data)
+                header_mode_param = "auto" if header_mode == "Auto-detect" else \
+                    "first_only" if header_mode == "Only at the beginning" else "every_page"
+                header_idx, header_row = detect_real_header(
+                    table_data, header_mode=header_mode_param)
 
                 extraction_detail = {
                     "page": page_num + 1,
@@ -211,7 +223,7 @@ def extract_with_pymupdf(pdf_path: str) -> Tuple[List[pd.DataFrame], Dict]:
         return [], {"error": f"PyMuPDF error: {str(e)}"}
 
 
-def extract_with_tabula(pdf_path: str, pages: str = "all") -> Tuple[List[pd.DataFrame], Dict]:
+def extract_with_tabula(pdf_path: str, pages: str = "all", header_mode: str = "auto") -> Tuple[List[pd.DataFrame], Dict]:
     """Extract tables using Tabula with improved header detection"""
     if not TABULA_AVAILABLE:
         return [], {"error": "Tabula not available"}
@@ -259,7 +271,10 @@ def extract_with_tabula(pdf_path: str, pages: str = "all") -> Tuple[List[pd.Data
                     table_data = [df.columns.tolist()] + df.values.tolist()
 
                     # Detect real header
-                    header_idx, header_row = detect_real_header(table_data)
+                    header_mode_param = "auto" if header_mode == "Auto-detect" else \
+                        "first_only" if header_mode == "Only at the beginning" else "every_page"
+                    header_idx, header_row = detect_real_header(
+                        table_data, header_mode=header_mode_param)
 
                     detail = {
                         "table": i + 1,
@@ -420,6 +435,15 @@ def main():
                     "Enter pages (e.g., '1,3,5-7')", "1")
                 pages_param = custom_pages
 
+            # Header detection options
+            st.sidebar.subheader("Header Detection")
+            header_frequency = st.sidebar.radio(
+                "How often do headers appear?",
+                ["Only at the beginning", "On every page", "Auto-detect"],
+                index=2,
+                help="Choose how to handle headers across multiple pages"
+            )
+
             # Cleaning options
             st.sidebar.subheader("Data Cleaning")
             remove_empty_rows = st.sidebar.checkbox("Remove empty rows", True)
@@ -432,10 +456,11 @@ def main():
 
                     # Extract based on selected method
                     if selected_method == "PyMuPDF":
-                        tables, metadata = extract_with_pymupdf(tmp_path)
+                        tables, metadata = extract_with_pymupdf(
+                            tmp_path, header_frequency)
                     elif selected_method == "Tabula":
                         tables, metadata = extract_with_tabula(
-                            tmp_path, pages_param)
+                            tmp_path, pages_param, header_frequency)
                     elif selected_method == "PDFMiner (Text)":
                         text, metadata = extract_text_with_pdfminer(tmp_path)
                         tables = []
