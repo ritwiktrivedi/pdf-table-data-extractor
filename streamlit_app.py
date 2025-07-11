@@ -147,6 +147,8 @@ def detect_real_header(table_data: List[List[str]], max_header_row: int = 3,
     return best_header_idx, table_data[best_header_idx] if best_header_idx < len(table_data) else []
 
 
+# ... (imports and setup as before) ...
+
 def merge_split_rows(df: pd.DataFrame, id_column_index: int = 0, threshold_empty_cols: int = 2) -> pd.DataFrame:
     """
     Merge rows that are likely split across multiple lines due to formatting issues.
@@ -168,7 +170,7 @@ def merge_split_rows(df: pd.DataFrame, id_column_index: int = 0, threshold_empty
             current_row = row_values
             continue
 
-        # Heuristic: If the "ID" column is not empty and there are enough filled values, start a new row
+        # Start new row if the ID column has content and sufficient non-empty values
         is_new_row = str(row_values[id_column_index]).strip(
         ) != "" and non_empty_count > len(row_values) - threshold_empty_cols
 
@@ -176,89 +178,72 @@ def merge_split_rows(df: pd.DataFrame, id_column_index: int = 0, threshold_empty
             merged_rows.append(current_row)
             current_row = row_values
         else:
-            # Append current row's values to previous row
+            # Merge this row into the current row
             for i in range(len(row_values)):
-                if str(row_values[i]).strip():
+                val = str(row_values[i]).strip()
+                if val:
                     if not str(current_row[i]).strip():
-                        current_row[i] = row_values[i]
+                        current_row[i] = val
                     else:
                         current_row[i] = str(
-                            current_row[i]) + " " + str(row_values[i])
+                            current_row[i]).strip() + " " + val
 
     if current_row:
         merged_rows.append(current_row)
 
     return pd.DataFrame(merged_rows, columns=df.columns)
 
+# Insert into `extract_with_pymupdf()` inside the for-loop after DataFrame is created:
+#     df = pd.DataFrame(data_rows, columns=clean_header)
+#     df = merge_split_rows(df)
+
 
 def extract_with_pymupdf(pdf_path: str, header_mode: str = "auto") -> Tuple[List[pd.DataFrame], Dict]:
-    """Extract tables using PyMuPDF with improved header detection"""
     if not PYMUPDF_AVAILABLE:
         return [], {"error": "PyMuPDF not available"}
 
     try:
         doc = fitz.open(pdf_path)
         tables = []
-        metadata = {
-            "total_pages": len(doc),
-            "method": "PyMuPDF",
-            "tables_found": 0,
-            "extraction_details": []
-        }
+        metadata = {"total_pages": len(
+            doc), "method": "PyMuPDF", "tables_found": 0, "extraction_details": []}
 
         for page_num in range(len(doc)):
             page = doc.load_page(page_num)
-
-            # Try to find tables
             tabs = page.find_tables()
 
             for tab_idx, tab in enumerate(tabs):
-                # Extract table data
                 table_data = tab.extract()
                 if not table_data:
                     continue
 
-                # Detect real header row
                 header_mode_param = "auto" if header_mode == "Auto-detect" else \
                     "first_only" if header_mode == "Only at the beginning" else "every_page"
                 header_idx, header_row = detect_real_header(
                     table_data, header_mode=header_mode_param)
 
-                extraction_detail = {
+                detail = {
                     "page": page_num + 1,
                     "table": tab_idx + 1,
                     "original_rows": len(table_data),
                     "detected_header_row": header_idx,
-                    # First 5 columns for preview
                     "header_content": header_row[:5] if header_row else []
                 }
 
                 if header_idx >= 0 and header_idx < len(table_data):
-                    # Use detected header
                     header = table_data[header_idx]
                     data_rows = table_data[header_idx + 1:]
-
-                    # Clean header names
-                    clean_header = []
-                    for i, col in enumerate(header):
-                        col_name = str(col).strip()
-                        if not col_name or col_name.lower() in ['', 'nan', 'none']:
-                            col_name = f"Column_{i+1}"
-                        clean_header.append(col_name)
-
-                    # Create DataFrame
-                    if data_rows:
-                        df = pd.DataFrame(data_rows, columns=clean_header)
-                        df = merge_split_rows(df)
-                    else:
-                        df = pd.DataFrame(columns=clean_header)
+                    clean_header = [str(c).strip() if str(c).strip(
+                    ) else f"Column_{i+1}" for i, c in enumerate(header)]
+                    df = pd.DataFrame(data_rows, columns=clean_header)
+                    df = merge_split_rows(df)
                 else:
-                    # Fallback: use first row as header
                     df = pd.DataFrame(table_data[1:], columns=table_data[0])
+                    df = merge_split_rows(df)
 
                 df.name = f"Page_{page_num + 1}_Table_{tab_idx + 1}"
                 tables.append(df)
-                metadata["extraction_details"].append(extraction_detail)
+                metadata["extraction_details"].append(detail)
 
         metadata["tables_found"] = len(tables)
         doc.close()
@@ -267,14 +252,16 @@ def extract_with_pymupdf(pdf_path: str, header_mode: str = "auto") -> Tuple[List
     except Exception as e:
         return [], {"error": f"PyMuPDF error: {str(e)}"}
 
+# Insert into `extract_with_tabula()` after df is created:
+#     new_df = pd.DataFrame(new_data, columns=clean_header)
+#     new_df = merge_split_rows(new_df)
+
 
 def extract_with_tabula(pdf_path: str, pages: str = "all", header_mode: str = "auto") -> Tuple[List[pd.DataFrame], Dict]:
-    """Extract tables using Tabula with improved header detection"""
     if not TABULA_AVAILABLE:
         return [], {"error": "Tabula not available"}
 
     try:
-        # Try different extraction methods
         methods = [
             {"method": "lattice", "multiple_tables": True},
             {"method": "stream", "multiple_tables": True},
@@ -288,23 +275,17 @@ def extract_with_tabula(pdf_path: str, pages: str = "all", header_mode: str = "a
         for method_config in methods:
             try:
                 if method_config["multiple_tables"]:
-                    dfs = tabula.read_pdf(
-                        pdf_path,
-                        pages=pages,
-                        multiple_tables=True,
-                        lattice=(method_config["method"] == "lattice"),
-                        stream=(method_config["method"] == "stream")
-                    )
+                    dfs = tabula.read_pdf(pdf_path, pages=pages, multiple_tables=True,
+                                          lattice=(
+                                              method_config["method"] == "lattice"),
+                                          stream=(method_config["method"] == "stream"))
                 else:
-                    df = tabula.read_pdf(
-                        pdf_path,
-                        pages=pages,
-                        lattice=(method_config["method"] == "lattice"),
-                        stream=(method_config["method"] == "stream")
-                    )
+                    df = tabula.read_pdf(pdf_path, pages=pages,
+                                         lattice=(
+                                             method_config["method"] == "lattice"),
+                                         stream=(method_config["method"] == "stream"))
                     dfs = [df] if not df.empty else []
 
-                # Process each DataFrame to fix headers
                 processed_dfs = []
                 extraction_details = []
 
@@ -312,10 +293,7 @@ def extract_with_tabula(pdf_path: str, pages: str = "all", header_mode: str = "a
                     if df.empty:
                         continue
 
-                    # Convert DataFrame to list format for header detection
                     table_data = [df.columns.tolist()] + df.values.tolist()
-
-                    # Detect real header
                     header_mode_param = "auto" if header_mode == "Auto-detect" else \
                         "first_only" if header_mode == "Only at the beginning" else "every_page"
                     header_idx, header_row = detect_real_header(
@@ -328,31 +306,18 @@ def extract_with_tabula(pdf_path: str, pages: str = "all", header_mode: str = "a
                         "header_content": header_row[:5] if header_row else []
                     }
 
-                    if header_idx > 0:  # Header is not the first row
-                        # Reconstruct DataFrame with correct header
+                    if header_idx >= 0:
                         new_header = table_data[header_idx]
                         new_data = table_data[header_idx + 1:]
-
-                        # Clean header names
-                        clean_header = []
-                        for j, col in enumerate(new_header):
-                            col_name = str(col).strip()
-                            if not col_name or col_name.lower() in ['', 'nan', 'none']:
-                                col_name = f"Column_{j+1}"
-                            clean_header.append(col_name)
-
-                        if new_data:
-                            new_df = pd.DataFrame(
-                                new_data, columns=clean_header)
-                            new_df = merge_split_rows(new_df)
-                        else:
-                            new_df = pd.DataFrame(columns=clean_header)
-
+                        clean_header = [str(c).strip() if str(c).strip(
+                        ) else f"Column_{j+1}" for j, c in enumerate(new_header)]
+                        new_df = pd.DataFrame(new_data, columns=clean_header)
+                        new_df = merge_split_rows(new_df)
                         new_df.name = f"Table_{i + 1}"
                         processed_dfs.append(new_df)
                     else:
-                        # Use original DataFrame
                         df.name = f"Table_{i + 1}"
+                        df = merge_split_rows(df)
                         processed_dfs.append(df)
 
                     extraction_details.append(detail)
@@ -366,13 +331,18 @@ def extract_with_tabula(pdf_path: str, pages: str = "all", header_mode: str = "a
                         "extraction_details": extraction_details
                     }
 
-            except Exception as e:
+            except Exception:
                 continue
 
         return best_result, best_metadata
 
     except Exception as e:
         return [], {"error": f"Tabula error: {str(e)}"}
+
+# Keep the rest of your `main()` Streamlit app as it is
+
+# You already call `clean_dataframe()` before displaying — that’s good.
+# Just ensure `merge_split_rows()` is applied after creating the DataFrame and before displaying or downloading it.
 
 
 def extract_text_with_pdfminer(pdf_path: str) -> Tuple[str, Dict]:
