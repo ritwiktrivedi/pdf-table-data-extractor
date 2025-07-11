@@ -5,30 +5,15 @@ numpy>=1.21.0
 
 # PDF Processing Libraries
 pymupdf>=1.23.0
-tabula-py>=2.5.0
-camelot-py[cv]>=0.10.0
 pdfminer.six>=20221105
 
-# Additional Dependencies for PDF Processing
-# Required for Camelot
-opencv-python>=4.5.0
-ghostscript>=0.7
+# Tabula (may have issues on Streamlit Cloud)
+tabula-py>=2.5.0
 
-# Java (required for Tabula) - Install separately
-# For Ubuntu/Debian: sudo apt-get install default-jre
-# For macOS: brew install java
-# For Windows: Download from Oracle or OpenJDK
+# Camelot - Use minimal version for cloud
+camelot-py[base]>=0.10.0
 
-# Optional: For better performance
-openpyxl>=3.0.0  # For Excel export
-xlsxwriter>=3.0.0  # For Excel formatting
-
-# System dependencies (install via package manager)
-# For Camelot on Ubuntu/Debian:
-# sudo apt-get install python3-tk ghostscript
-# 
-# For Camelot on macOS:
-# brew install ghostscript tcl-tk
-#
-# For Camelot on Windows:
-# Download and install Ghostscript from https://www.ghostscript.com/download/gsdnld.html
+# Additional Dependencies
+opencv-python-headless>=4.5.0
+openpyxl>=3.0.0
+xlsxwriter>=3.0.0
