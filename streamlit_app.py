@@ -147,6 +147,50 @@ def detect_real_header(table_data: List[List[str]], max_header_row: int = 3,
     return best_header_idx, table_data[best_header_idx] if best_header_idx < len(table_data) else []
 
 
+def merge_split_rows(df: pd.DataFrame, id_column_index: int = 0, threshold_empty_cols: int = 2) -> pd.DataFrame:
+    """
+    Merge rows that are likely split across multiple lines due to formatting issues.
+    Args:
+        df: DataFrame to clean.
+        id_column_index: Index of column which likely starts a new row (e.g., an ID or serial number).
+        threshold_empty_cols: If a row has this many or more empty columns, it may be a continuation.
+    Returns:
+        Cleaned DataFrame with split rows merged.
+    """
+    merged_rows = []
+    current_row = None
+
+    for _, row in df.iterrows():
+        row_values = row.tolist()
+        non_empty_count = sum(1 for val in row_values if str(val).strip())
+
+        if current_row is None:
+            current_row = row_values
+            continue
+
+        # Heuristic: If the "ID" column is not empty and there are enough filled values, start a new row
+        is_new_row = str(row_values[id_column_index]).strip(
+        ) != "" and non_empty_count > len(row_values) - threshold_empty_cols
+
+        if is_new_row:
+            merged_rows.append(current_row)
+            current_row = row_values
+        else:
+            # Append current row's values to previous row
+            for i in range(len(row_values)):
+                if str(row_values[i]).strip():
+                    if not str(current_row[i]).strip():
+                        current_row[i] = row_values[i]
+                    else:
+                        current_row[i] = str(
+                            current_row[i]) + " " + str(row_values[i])
+
+    if current_row:
+        merged_rows.append(current_row)
+
+    return pd.DataFrame(merged_rows, columns=df.columns)
+
+
 def extract_with_pymupdf(pdf_path: str, header_mode: str = "auto") -> Tuple[List[pd.DataFrame], Dict]:
     """Extract tables using PyMuPDF with improved header detection"""
     if not PYMUPDF_AVAILABLE:
@@ -205,6 +249,7 @@ def extract_with_pymupdf(pdf_path: str, header_mode: str = "auto") -> Tuple[List
                     # Create DataFrame
                     if data_rows:
                         df = pd.DataFrame(data_rows, columns=clean_header)
+                        df = merge_split_rows(df)
                     else:
                         df = pd.DataFrame(columns=clean_header)
                 else:
@@ -299,6 +344,7 @@ def extract_with_tabula(pdf_path: str, pages: str = "all", header_mode: str = "a
                         if new_data:
                             new_df = pd.DataFrame(
                                 new_data, columns=clean_header)
+                            new_df = merge_split_rows(new_df)
                         else:
                             new_df = pd.DataFrame(columns=clean_header)
 
