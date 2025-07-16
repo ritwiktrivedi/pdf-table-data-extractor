@@ -171,15 +171,44 @@ def merge_split_rows(df: pd.DataFrame, id_column_index: int = 0, threshold_empty
 
     for _, row in df.iterrows():
         row_values = row.tolist()
-        non_empty_count = sum(1 for val in row_values if str(val).strip())
+
+        # Count non-empty values (excluding NaN, None, empty strings)
+        non_empty_count = sum(1 for val in row_values if str(
+            val).strip() and str(val).strip().lower() not in ['nan', 'none', ''])
+        empty_count = len(row_values) - non_empty_count
 
         if current_row is None:
             current_row = row_values
             continue
 
-        # Start new row if the ID column has content and sufficient non-empty values
-        is_new_row = str(row_values[id_column_index]).strip(
-        ) != "" and non_empty_count > len(row_values) - threshold_empty_cols
+        # Improved logic for determining if this is a new row
+        is_new_row = False
+
+        # Check if this row has significant content (not just a continuation line)
+        has_significant_content = non_empty_count >= max(
+            1, len(row_values) // 2)  # At least half the columns or 1 column
+
+        # Check if the ID column has content (suggests new row)
+        id_has_content = str(row_values[id_column_index]).strip() and str(
+            row_values[id_column_index]).strip().lower() not in ['nan', 'none', '']
+
+        # Check if this looks like a continuation (too many empty columns)
+        looks_like_continuation = empty_count >= threshold_empty_cols
+
+        # Decision logic:
+        # 1. If ID column has content AND row has significant content -> likely new row
+        # 2. If row has significant content AND doesn't look like continuation -> likely new row
+        # 3. If row looks like continuation -> merge with previous
+
+        if id_has_content and has_significant_content:
+            is_new_row = True
+        elif has_significant_content and not looks_like_continuation:
+            is_new_row = True
+        elif looks_like_continuation:
+            is_new_row = False
+        else:
+            # Default: if row has some content, treat as new row
+            is_new_row = non_empty_count > 0
 
         if is_new_row:
             merged_rows.append(current_row)
@@ -188,12 +217,14 @@ def merge_split_rows(df: pd.DataFrame, id_column_index: int = 0, threshold_empty
             # Merge this row into the current row
             for i in range(len(row_values)):
                 val = str(row_values[i]).strip()
-                if val:
-                    if not str(current_row[i]).strip():
+                if val and val.lower() not in ['nan', 'none', '']:
+                    current_val = str(current_row[i]).strip()
+                    if not current_val or current_val.lower() in ['nan', 'none', '']:
                         current_row[i] = val
                     else:
-                        current_row[i] = str(
-                            current_row[i]).strip() + " " + val
+                        # Append with space, but avoid duplicates
+                        if val not in current_val:
+                            current_row[i] = current_val + " " + val
 
     if current_row:
         merged_rows.append(current_row)
