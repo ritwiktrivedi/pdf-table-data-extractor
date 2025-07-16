@@ -147,8 +147,6 @@ def detect_real_header(table_data: List[List[str]], max_header_row: int = 3,
     return best_header_idx, table_data[best_header_idx] if best_header_idx < len(table_data) else []
 
 
-# ... (imports and setup as before) ...
-
 def merge_split_rows(df: pd.DataFrame, id_column_index: int = 0, threshold_empty_cols: int = 2) -> pd.DataFrame:
     """
     Merge rows that are likely split across multiple lines due to formatting issues.
@@ -159,6 +157,9 @@ def merge_split_rows(df: pd.DataFrame, id_column_index: int = 0, threshold_empty
     Returns:
         Cleaned DataFrame with split rows merged.
     """
+    if df.empty:
+        return df
+
     merged_rows = []
     current_row = None
 
@@ -193,12 +194,106 @@ def merge_split_rows(df: pd.DataFrame, id_column_index: int = 0, threshold_empty
 
     return pd.DataFrame(merged_rows, columns=df.columns)
 
-# Insert into `extract_with_pymupdf()` inside the for-loop after DataFrame is created:
-#     df = pd.DataFrame(data_rows, columns=clean_header)
-#     df = merge_split_rows(df)
+
+def are_tables_compatible(df1: pd.DataFrame, df2: pd.DataFrame, similarity_threshold: float = 0.7) -> bool:
+    """
+    Check if two tables are compatible for merging (same structure/headers)
+    """
+    if df1.empty or df2.empty:
+        return False
+
+    # Check if they have the same number of columns
+    if len(df1.columns) != len(df2.columns):
+        return False
+
+    # Check header similarity
+    headers1 = [str(col).strip().lower() for col in df1.columns]
+    headers2 = [str(col).strip().lower() for col in df2.columns]
+
+    matches = sum(1 for h1, h2 in zip(headers1, headers2) if h1 == h2)
+    similarity = matches / len(headers1)
+
+    return similarity >= similarity_threshold
 
 
-def extract_with_pymupdf(pdf_path: str, header_mode: str = "auto") -> Tuple[List[pd.DataFrame], Dict]:
+def merge_tables_across_pages(tables: List[pd.DataFrame], table_mode: str = "separate") -> List[pd.DataFrame]:
+    """
+    Merge tables across pages based on the selected mode
+    Args:
+        tables: List of DataFrames from different pages
+        table_mode: "separate" (keep separate), "merge_all" (merge all into one), or "merge_compatible" (merge compatible ones)
+    Returns:
+        List of merged DataFrames
+    """
+    if not tables or table_mode == "separate":
+        return tables
+
+    if table_mode == "merge_all":
+        # Merge all tables into one, even if they have different structures
+        if not tables:
+            return []
+
+        # Use the first table's structure as base
+        base_df = tables[0].copy()
+
+        for df in tables[1:]:
+            if df.empty:
+                continue
+
+            # If columns don't match, try to align them
+            if list(df.columns) != list(base_df.columns):
+                # Create a new dataframe with base columns
+                aligned_df = pd.DataFrame(columns=base_df.columns)
+
+                # Map columns by position or name
+                for i, col in enumerate(df.columns):
+                    if i < len(base_df.columns):
+                        aligned_df[base_df.columns[i]] = df[col]
+
+                df = aligned_df
+
+            # Concatenate the tables
+            base_df = pd.concat([base_df, df], ignore_index=True)
+
+        base_df.name = "Merged_Table"
+        return [base_df]
+
+    elif table_mode == "merge_compatible":
+        # Group compatible tables and merge them
+        merged_groups = []
+        used_indices = set()
+
+        for i, table1 in enumerate(tables):
+            if i in used_indices or table1.empty:
+                continue
+
+            # Start a new group with this table
+            current_group = [table1]
+            used_indices.add(i)
+
+            # Find compatible tables
+            for j, table2 in enumerate(tables[i+1:], i+1):
+                if j in used_indices or table2.empty:
+                    continue
+
+                if are_tables_compatible(table1, table2):
+                    current_group.append(table2)
+                    used_indices.add(j)
+
+            # Merge the group
+            if len(current_group) == 1:
+                merged_groups.append(current_group[0])
+            else:
+                merged_df = pd.concat(current_group, ignore_index=True)
+                merged_df.name = f"Merged_Group_{len(merged_groups) + 1}"
+                merged_groups.append(merged_df)
+
+        return merged_groups
+
+    return tables
+
+
+def extract_with_pymupdf(pdf_path: str, header_mode: str = "auto", table_mode: str = "separate") -> Tuple[List[pd.DataFrame], Dict]:
     if not PYMUPDF_AVAILABLE:
         return [], {"error": "PyMuPDF not available"}
 
@@ -245,19 +340,21 @@ def extract_with_pymupdf(pdf_path: str, header_mode: str = "auto") -> Tuple[List
                 tables.append(df)
                 metadata["extraction_details"].append(detail)
 
-        metadata["tables_found"] = len(tables)
+        # Merge tables based on table_mode
+        merged_tables = merge_tables_across_pages(tables, table_mode)
+
+        metadata["tables_found"] = len(merged_tables)
+        metadata["original_tables_found"] = len(tables)
+        metadata["table_mode"] = table_mode
+
         doc.close()
-        return tables, metadata
+        return merged_tables, metadata
 
     except Exception as e:
         return [], {"error": f"PyMuPDF error: {str(e)}"}
 
-# Insert into `extract_with_tabula()` after df is created:
-#     new_df = pd.DataFrame(new_data, columns=clean_header)
-#     new_df = merge_split_rows(new_df)
 
-
-def extract_with_tabula(pdf_path: str, pages: str = "all", header_mode: str = "auto") -> Tuple[List[pd.DataFrame], Dict]:
+def extract_with_tabula(pdf_path: str, pages: str = "all", header_mode: str = "auto", table_mode: str = "separate") -> Tuple[List[pd.DataFrame], Dict]:
     if not TABULA_AVAILABLE:
         return [], {"error": "Tabula not available"}
 
@@ -322,12 +419,18 @@ def extract_with_tabula(pdf_path: str, pages: str = "all", header_mode: str = "a
 
                     extraction_details.append(detail)
 
-                if len(processed_dfs) > len(best_result):
-                    best_result = processed_dfs
+                # Merge tables based on table_mode
+                merged_dfs = merge_tables_across_pages(
+                    processed_dfs, table_mode)
+
+                if len(merged_dfs) > len(best_result):
+                    best_result = merged_dfs
                     best_metadata = {
                         "method": f"Tabula ({method_config['method']})",
-                        "tables_found": len(processed_dfs),
+                        "tables_found": len(merged_dfs),
+                        "original_tables_found": len(processed_dfs),
                         "multiple_tables": method_config["multiple_tables"],
+                        "table_mode": table_mode,
                         "extraction_details": extraction_details
                     }
 
@@ -338,11 +441,6 @@ def extract_with_tabula(pdf_path: str, pages: str = "all", header_mode: str = "a
 
     except Exception as e:
         return [], {"error": f"Tabula error: {str(e)}"}
-
-# Keep the rest of your `main()` Streamlit app as it is
-
-# You already call `clean_dataframe()` before displaying — that’s good.
-# Just ensure `merge_split_rows()` is applied after creating the DataFrame and before displaying or downloading it.
 
 
 def extract_text_with_pdfminer(pdf_path: str) -> Tuple[str, Dict]:
@@ -394,7 +492,7 @@ def main():
 
     st.title("📊 PDF Table Extractor")
     st.markdown(
-        "Extract tabular data from PDFs using PyMuPDF and Tabula with improved header detection")
+        "Extract tabular data from PDFs using PyMuPDF and Tabula with improved header detection and table merging")
 
     # Check dependencies
     available_libs, missing_libs = check_dependencies()
@@ -460,6 +558,23 @@ def main():
                 help="Choose how to handle headers across multiple pages"
             )
 
+            # NEW: Table merging options
+            st.sidebar.subheader("Table Handling")
+            table_mode = st.sidebar.radio(
+                "How to handle tables across pages?",
+                ["Keep separate", "Merge all into one table",
+                    "Merge compatible tables"],
+                index=0,
+                help="Choose how to handle tables found across multiple pages"
+            )
+
+            # Convert radio button selection to parameter
+            table_mode_param = "separate"
+            if table_mode == "Merge all into one table":
+                table_mode_param = "merge_all"
+            elif table_mode == "Merge compatible tables":
+                table_mode_param = "merge_compatible"
+
             # Cleaning options
             st.sidebar.subheader("Data Cleaning")
             remove_empty_rows = st.sidebar.checkbox("Remove empty rows", True)
@@ -473,10 +588,10 @@ def main():
                     # Extract based on selected method
                     if selected_method == "PyMuPDF":
                         tables, metadata = extract_with_pymupdf(
-                            tmp_path, header_frequency)
+                            tmp_path, header_frequency, table_mode_param)
                     elif selected_method == "Tabula":
                         tables, metadata = extract_with_tabula(
-                            tmp_path, pages_param, header_frequency)
+                            tmp_path, pages_param, header_frequency, table_mode_param)
                     elif selected_method == "PDFMiner (Text)":
                         text, metadata = extract_text_with_pdfminer(tmp_path)
                         tables = []
@@ -502,10 +617,17 @@ def main():
                                     st.warning(
                                         "No tables found. Try a different extraction method.")
                                 else:
+                                    # Display table merging info
+                                    if "original_tables_found" in metadata:
+                                        st.info(f"Found {metadata['original_tables_found']} tables originally, "
+                                                f"merged into {metadata['tables_found']} tables using '{table_mode}' mode")
+
                                     # Display each table
                                     for i, df in enumerate(tables):
+                                        table_name = getattr(
+                                            df, 'name', f"Table_{i+1}")
                                         st.write(
-                                            f"**Table {i+1}** ({df.shape[0]} rows × {df.shape[1]} columns)")
+                                            f"**{table_name}** ({df.shape[0]} rows × {df.shape[1]} columns)")
 
                                         # Show extraction details if available
                                         if "extraction_details" in metadata and i < len(metadata["extraction_details"]):
@@ -528,9 +650,9 @@ def main():
                                             # Download button
                                             csv = df_clean.to_csv(index=False)
                                             st.download_button(
-                                                label=f"Download Table {i+1} as CSV",
+                                                label=f"Download {table_name} as CSV",
                                                 data=csv,
-                                                file_name=f"table_{i+1}.csv",
+                                                file_name=f"{table_name.lower().replace(' ', '_')}.csv",
                                                 mime="text/csv"
                                             )
 
