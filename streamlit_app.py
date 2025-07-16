@@ -181,9 +181,6 @@ def merge_split_rows(df: pd.DataFrame, id_column_index: int = 0, threshold_empty
             current_row = row_values
             continue
 
-        # Improved logic for determining if this is a new row
-        is_new_row = False
-
         # Check if this row has significant content (not just a continuation line)
         has_significant_content = non_empty_count >= max(
             1, len(row_values) // 2)  # At least half the columns or 1 column
@@ -195,15 +192,22 @@ def merge_split_rows(df: pd.DataFrame, id_column_index: int = 0, threshold_empty
         # Check if this looks like a continuation (too many empty columns)
         looks_like_continuation = empty_count >= threshold_empty_cols
 
-        # Decision logic:
-        # 1. If ID column has content AND row has significant content -> likely new row
-        # 2. If row has significant content AND doesn't look like continuation -> likely new row
-        # 3. If row looks like continuation -> merge with previous
+        # NEW: Check if this row has only one column with content (likely a continuation)
+        has_only_one_content = non_empty_count == 1
 
-        if id_has_content and has_significant_content:
+        # Decision logic:
+        is_new_row = False
+
+        # Special case: If row has only one column with content, always merge with previous
+        if has_only_one_content:
+            is_new_row = False
+        # If ID column has content AND row has significant content -> likely new row
+        elif id_has_content and has_significant_content:
             is_new_row = True
+        # If row has significant content AND doesn't look like continuation -> likely new row
         elif has_significant_content and not looks_like_continuation:
             is_new_row = True
+        # If row looks like continuation -> merge with previous
         elif looks_like_continuation:
             is_new_row = False
         else:
