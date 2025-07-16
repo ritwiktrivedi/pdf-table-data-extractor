@@ -95,20 +95,26 @@ def is_likely_header_row(row_data: List[str], min_non_empty_ratio: float = 0.6) 
 
 
 def detect_real_header(table_data: List[List[str]], max_header_row: int = 3,
-                       header_mode: str = "auto") -> Tuple[int, List[str]]:
+                       header_mode: str = "auto", is_first_table: bool = True) -> Tuple[int, List[str]]:
     """
     Detect the actual header row in table data
     Args:
         table_data: List of rows (each row is a list of cells)
         max_header_row: Maximum row index to check for headers
         header_mode: "auto", "first_only", or "every_page"
+        is_first_table: Whether this is the first table being processed
     Returns: (header_row_index, header_row_data)
     """
     if not table_data:
         return -1, []
 
-    if header_mode == "first_only":
-        # Only use first row as header
+    # FIXED: If header_mode is "first_only" and this is NOT the first table,
+    # treat all rows as data (no header detection)
+    if header_mode == "first_only" and not is_first_table:
+        return -1, []
+
+    if header_mode == "first_only" and is_first_table:
+        # Only use first row as header for the first table
         return 0, table_data[0]
 
     best_header_idx = 0
@@ -303,6 +309,9 @@ def extract_with_pymupdf(pdf_path: str, header_mode: str = "auto", table_mode: s
         metadata = {"total_pages": len(
             doc), "method": "PyMuPDF", "tables_found": 0, "extraction_details": []}
 
+        # FIXED: Track if we've processed the first table for header detection
+        first_table_processed = False
+
         for page_num in range(len(doc)):
             page = doc.load_page(page_num)
             tabs = page.find_tables()
@@ -314,15 +323,21 @@ def extract_with_pymupdf(pdf_path: str, header_mode: str = "auto", table_mode: s
 
                 header_mode_param = "auto" if header_mode == "Auto-detect" else \
                     "first_only" if header_mode == "Only at the beginning" else "every_page"
+
+                # FIXED: Pass is_first_table parameter
                 header_idx, header_row = detect_real_header(
-                    table_data, header_mode=header_mode_param)
+                    table_data,
+                    header_mode=header_mode_param,
+                    is_first_table=not first_table_processed
+                )
 
                 detail = {
                     "page": page_num + 1,
                     "table": tab_idx + 1,
                     "original_rows": len(table_data),
                     "detected_header_row": header_idx,
-                    "header_content": header_row[:5] if header_row else []
+                    "header_content": header_row[:5] if header_row else [],
+                    "is_first_table": not first_table_processed
                 }
 
                 if header_idx >= 0 and header_idx < len(table_data):
@@ -332,8 +347,18 @@ def extract_with_pymupdf(pdf_path: str, header_mode: str = "auto", table_mode: s
                     ) else f"Column_{i+1}" for i, c in enumerate(header)]
                     df = pd.DataFrame(data_rows, columns=clean_header)
                     df = merge_split_rows(df)
+                    first_table_processed = True
                 else:
-                    df = pd.DataFrame(table_data[1:], columns=table_data[0])
+                    # FIXED: For subsequent tables when header_mode is "first_only",
+                    # use the header from the first table if available
+                    if header_mode_param == "first_only" and tables:
+                        # Use the same header as the first table
+                        first_table_header = tables[0].columns.tolist()
+                        df = pd.DataFrame(
+                            table_data, columns=first_table_header)
+                    else:
+                        df = pd.DataFrame(
+                            table_data[1:], columns=table_data[0])
                     df = merge_split_rows(df)
 
                 df.name = f"Page_{page_num + 1}_Table_{tab_idx + 1}"
@@ -386,6 +411,9 @@ def extract_with_tabula(pdf_path: str, pages: str = "all", header_mode: str = "a
                 processed_dfs = []
                 extraction_details = []
 
+                # FIXED: Track if we've processed the first table for header detection
+                first_table_processed = False
+
                 for i, df in enumerate(dfs):
                     if df.empty:
                         continue
@@ -393,14 +421,20 @@ def extract_with_tabula(pdf_path: str, pages: str = "all", header_mode: str = "a
                     table_data = [df.columns.tolist()] + df.values.tolist()
                     header_mode_param = "auto" if header_mode == "Auto-detect" else \
                         "first_only" if header_mode == "Only at the beginning" else "every_page"
+
+                    # FIXED: Pass is_first_table parameter
                     header_idx, header_row = detect_real_header(
-                        table_data, header_mode=header_mode_param)
+                        table_data,
+                        header_mode=header_mode_param,
+                        is_first_table=not first_table_processed
+                    )
 
                     detail = {
                         "table": i + 1,
                         "original_rows": len(df),
                         "detected_header_row": header_idx,
-                        "header_content": header_row[:5] if header_row else []
+                        "header_content": header_row[:5] if header_row else [],
+                        "is_first_table": not first_table_processed
                     }
 
                     if header_idx >= 0:
@@ -412,10 +446,22 @@ def extract_with_tabula(pdf_path: str, pages: str = "all", header_mode: str = "a
                         new_df = merge_split_rows(new_df)
                         new_df.name = f"Table_{i + 1}"
                         processed_dfs.append(new_df)
+                        first_table_processed = True
                     else:
-                        df.name = f"Table_{i + 1}"
-                        df = merge_split_rows(df)
-                        processed_dfs.append(df)
+                        # FIXED: For subsequent tables when header_mode is "first_only",
+                        # use the header from the first table if available
+                        if header_mode_param == "first_only" and processed_dfs:
+                            # Use the same header as the first table
+                            first_table_header = processed_dfs[0].columns.tolist(
+                            )
+                            new_df = pd.DataFrame(
+                                table_data, columns=first_table_header)
+                        else:
+                            new_df = df.copy()
+
+                        new_df.name = f"Table_{i + 1}"
+                        new_df = merge_split_rows(new_df)
+                        processed_dfs.append(new_df)
 
                     extraction_details.append(detail)
 
@@ -633,7 +679,7 @@ def main():
                                         if "extraction_details" in metadata and i < len(metadata["extraction_details"]):
                                             details = metadata["extraction_details"][i]
                                             st.caption(
-                                                f"Header detected at row {details['detected_header_row']}")
+                                                f"Header detected at row {details['detected_header_row']} (First table: {details.get('is_first_table', 'N/A')})")
 
                                         # Clean the dataframe
                                         df_clean = clean_dataframe(
